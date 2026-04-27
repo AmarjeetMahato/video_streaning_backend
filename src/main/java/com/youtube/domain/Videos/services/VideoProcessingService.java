@@ -3,6 +3,10 @@ package com.youtube.domain.Videos.services;
 
 import com.cloudinary.Cloudinary;
 import com.cloudinary.utils.ObjectUtils;
+import com.youtube.domain.VideoIndex.dto.VideoIndexDto;
+import com.youtube.domain.VideoIndex.services.VideoIndexServiceImpl;
+import com.youtube.domain.VideoQuality.dto.VideoQualityDto;
+import com.youtube.domain.VideoQuality.services.VideoQualityServiceImpl;
 import com.youtube.domain.Videos.repository.VideoRepository;
 import com.youtube.enums.VideoStatus;
 import lombok.RequiredArgsConstructor;
@@ -13,10 +17,12 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 @Service
 @RequiredArgsConstructor
@@ -24,9 +30,12 @@ public class VideoProcessingService {
 
     private final Cloudinary cloudinary;
     private final VideoRepository videoRepository;
+    private  final VideoIndexServiceImpl videoIndexService;
+    private  final VideoQualityServiceImpl videoQualityService;
 
     public void processAndUpload(String videoId, Path inputPath) {
         var resolutions = List.of("480p", "720p", "1080p");
+        List<Future<?>> futures = new ArrayList<>();
 
         // Java 25: Virtual Thread Executor का उपयोग करके वीडियो प्रोसेसिंग
         try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
@@ -34,19 +43,33 @@ public class VideoProcessingService {
             // तो यह अपने आप इंतज़ार करेगा (Auto-close) ताकि सारे टास्क पूरे हो जाएं।
             for (String res : resolutions) {
                 // 'resolutions' लिस्ट में मौजूद हर resolution (जैसे 1080p, 720p) के लिए लूप चलेगा।
-                executor.submit(() -> {
+                futures.add(executor.submit(() -> {
                     // हर resolution के लिए एक नया 'Virtual Thread' बनेगा और काम शुरू होगा।
                     try {
                         // यह मुख्य मेथड है जो वीडियो को प्रोसेस (Transcode) करेगा।
-                        processResolution(videoId, inputPath, res);
+                        String uploadedUrl =  processResolution(videoId, inputPath, res);
+
+                        VideoQualityDto dto = VideoQualityDto.builder()
+                                .videoId(videoId)
+                                .quality(res)
+                                .url(uploadedUrl)
+                                .format("mp4")
+                                .build();
+
+                        videoQualityService.createVideoQuality(dto);
                     } catch (Exception e) {
                         // अगर किसी एक टास्क में गड़बड़ होती है, तो यहाँ एरर थ्रो होगा।
                         throw new RuntimeException("Resolution failed: " + res, e);
                     }
-                });
+                }));
             }
             // यहाँ कोई 'executor.shutdown()' लिखने की ज़रूरत नहीं है।
             // 'try' ब्लॉक के अंत में यह खुद ही सारे थ्रेड्स के खत्म होने का वेट करेगा।
+            // 🔥 CRITICAL: Wait for all tasks
+            for (Future<?> future : futures) {
+                future.get(); // blocks + propagates exception
+            }
+
         } catch (Exception e) {
             // अगर पूरा प्रोसेस फेल हो जाता है या कोई गंभीर एरर आता है, तो स्टेटस अपडेट करें।
             updateVideoStatus(videoId, VideoStatus.FAILED, null);
@@ -56,15 +79,26 @@ public class VideoProcessingService {
         try {
             // Sabhi resolutions ke baad Master Playlist banayein
             String masterUrl = createAndUploadMasterPlaylist(videoId);
+            String spriteSheetUrl = generateSpriteSheet(videoId, inputPath);
+            VideoIndexDto dto = VideoIndexDto.builder()
+                    .videoId(videoId)
+                    .masterPlaylistUrl(masterUrl)
+                    .spriteSheetUrl(spriteSheetUrl)
+                    .build();
+
+
             updateVideoStatus(videoId, VideoStatus.READY, masterUrl);
+            videoIndexService.createVideoIndex(dto);
         } catch (IOException e) {
             updateVideoStatus(videoId, VideoStatus.FAILED, null);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
         } finally {
             cleanup(videoId, inputPath);
         }
     }
 
-    private void processResolution(String videoId, Path inputPath, String res) throws Exception {
+    private String processResolution(String videoId, Path inputPath, String res) throws Exception {
         // 1. आउटपुट डायरेक्टरी का पाथ बनाना (जैसे: temp/video123/1080p/)
         String outputDir = "temp/%s/%s/".formatted(videoId, res);
         // अगर फोल्डर मौजूद नहीं है, तो नया फोल्डर बनाना
@@ -100,7 +134,8 @@ ffmpeg -i "%s" -vf "scale=%s,drawtext=text='%s':x=10:y=10:fontsize=20:fontcolor=
         System.out.println("✅ Transcoding finished for " + res + ". Starting Cloudinary upload...");
 
         // 5. फाइनल स्टेप: तैयार की गई फाइलों को Cloudinary (Cloud Storage) पर अपलोड करना
-        uploadToCloudinary(videoId, res, outputDir);
+        String playlistUrl =  uploadToCloudinary(videoId, res, outputDir);
+        return playlistUrl;
     }
 
     private void executeCommand(String command, String taskName) throws Exception {
@@ -138,7 +173,7 @@ ffmpeg -i "%s" -vf "scale=%s,drawtext=text='%s':x=10:y=10:fontsize=20:fontcolor=
         }
     }
 
-    private void generateSpriteSheet(String videoId, Path inputPath) throws Exception {
+    private String generateSpriteSheet(String videoId, Path inputPath) throws Exception {
         // 1. प्रीव्यू इमेजेस के लिए एक अलग फोल्डर पाथ बनाना (जैसे: temp/video123/previews/)
         String outputDir = "temp/%s/previews/".formatted(videoId);
         Files.createDirectories(Paths.get(outputDir));
@@ -158,11 +193,15 @@ ffmpeg -i "%s" -vf "scale=%s,drawtext=text='%s':x=10:y=10:fontsize=20:fontcolor=
         // 3. बनी हुई 'sprite.jpg' फाइल को Cloudinary पर अपलोड करना
         File spriteFile = new File(outputDir + "sprite.jpg");
         if(spriteFile.exists()) {
-            cloudinary.uploader().upload(spriteFile, ObjectUtils.asMap(
+            var uploadResult =  cloudinary.uploader().upload(spriteFile, ObjectUtils.asMap(
                     "public_id", videoId + "/previews/sprite", // क्लाउड पर फाइल का नाम और रास्ता
                     "resource_type", "image"                   // बताना कि यह एक फोटो है
             ));
+
+            return  (String) uploadResult.get("secure_url");
         }
+
+        return  null;
     }
 
     private String createAndUploadMasterPlaylist(String videoId) throws IOException {
@@ -206,21 +245,22 @@ ffmpeg -i "%s" -vf "scale=%s,drawtext=text='%s':x=10:y=10:fontsize=20:fontcolor=
         return secureUrl;
     }
 
-    private void uploadToCloudinary(String videoId, String res, String dirPath) throws IOException {
+    private String uploadToCloudinary(String videoId, String res, String dirPath) throws IOException {
         // 1. उस फोल्डर को खोलना जहाँ प्रोसेस की गई फाइलें रखी हैं (जैसे: temp/video123/1080p/)
         File folder = new File(dirPath);
         File[] files = folder.listFiles(); // फोल्डर के अंदर की सभी फाइलों की लिस्ट बनाना
-
+        String finalPlaylistUrl = "";
         // अगर फोल्डर खाली है या नहीं मिला, तो एरर दिखा कर रुक जाना
         if (files == null || files.length == 0) {
-            System.err.println("No files found in " + dirPath + " to upload!");
-            return;
+            throw new IOException("No files found in " + dirPath);
         }
 
         System.out.println("Found " + files.length + " files in " + res + " folder. Uploading...");
 
         // 2. फोल्डर की हर एक फाइल पर लूप चलाना
         for (File file : files) {
+            // क्लाउड पर पाथ: videos/videoId/res/filename
+            String fileName = file.getName();
             // क्लाउड पर फाइल का रास्ता और नाम (Public ID) तैयार करना
             // यह फाइल के एक्सटेंशन (जैसे .ts या .m3u8) को हटाकर एक साफ नाम बनाता है
             String publicId = "%s/%s/%s".formatted(videoId, res, file.getName().replaceFirst("[.][^.]+$", ""));
@@ -231,13 +271,21 @@ ffmpeg -i "%s" -vf "scale=%s,drawtext=text='%s':x=10:y=10:fontsize=20:fontcolor=
             String resourceType = file.getName().endsWith(".ts") ? "video" : "raw";
 
             // 4. Cloudinary पर असल अपलोड कमांड
-            cloudinary.uploader().upload(file, ObjectUtils.asMap(
+            var uploadResult = cloudinary.uploader().upload(file, ObjectUtils.asMap(
                     "public_id", publicId,   // क्लाउड पर किस नाम से सेव होगा
-                    "resource_type", resourceType // फाइल का प्रकार क्या है
+                    "resource_type", resourceType, // फाइल का प्रकार क्या है
+                    "use_filename", true,
+                    "unique_filename", false
             ));
+
+            // अगर यह फाइल playlist.m3u8 है, तो इसका URL सेव कर लें
+            if(fileName.equals("playlist.m3u8")){
+                 finalPlaylistUrl  = (String) uploadResult.get("secure_url");
+            }
         }
 
         System.out.println("All files for " + res + " uploaded successfully.");
+        return finalPlaylistUrl;
     }
 
     private void updateVideoStatus(String videoId, VideoStatus status, String url) {

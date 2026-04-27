@@ -1,4 +1,9 @@
 package com.youtube.domain.VideoIndex.repository;
 
-public interface VideoIndexRepository {
+import com.youtube.domain.VideoIndex.entity.VideoIndex;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface VideoIndexRepository extends JpaRepository<VideoIndex,String> {
 }
