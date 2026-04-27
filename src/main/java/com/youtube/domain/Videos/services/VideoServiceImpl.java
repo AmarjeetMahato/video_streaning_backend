@@ -26,7 +26,6 @@ public class VideoServiceImpl implements IVideoService {
 
              Video video = this.videoMapper.toEntity(videoDto,file);
              Video savedVideo = this.videoRepository.save(video);
-
         try {
             Path tempPath = Files.createTempFile("raw_", file.getOriginalFilename());
             file.transferTo(tempPath);
